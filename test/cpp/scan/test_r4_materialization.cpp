@@ -106,7 +106,8 @@ struct test_arrow_source final : arrow_batch_source {
 
 std::shared_ptr<owned_arrow_batch> owned_fixture(std::shared_ptr<arrow_fixture> const& fixture)
 {
-  return std::make_shared<owned_arrow_batch>(fixture->schema, fixture->array, fixture);
+  return std::make_shared<owned_arrow_batch>(
+    fixture->schema, fixture->array, fixture, *std::pmr::new_delete_resource());
 }
 }  // namespace
 
@@ -226,7 +227,7 @@ TEST_CASE("R4 Arrow import owns its source through retirement and shared finish"
   sirius::exec::retire_lane lane(stream.value());
   int released = 0;
   auto f       = std::make_shared<arrow_fixture>(released);
-  auto owner   = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+  auto owner   = owned_fixture(f);
   materialization_program program{11, 7, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
   program.input_types = program.output_types;
   auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -501,7 +502,7 @@ TEST_CASE("R4 Arrow nullable slice retains values and rejects schema drift", "[r
   auto f          = std::make_shared<arrow_fixture>(released);
   f->array.offset = 1;
   f->array.length = 2;
-  auto owner      = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+  auto owner      = owned_fixture(f);
   materialization_program program{42, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
   program.input_types = std::vector{cudf::data_type{cudf::type_id::INT64}};
   REQUIRE_THROWS(import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref()));
@@ -588,7 +589,7 @@ TEST_CASE("R4 Arrow decimal imports normalize the approved carrier", "[r4][scan]
     __int128 values[3]{123, 456, 789};
     f->child_schema.format = format;
     f->buffers[1]          = values;
-    auto owner             = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner             = owned_fixture(f);
     materialization_program program{
       43, 1, {cudf::data_type{cudf::type_id::DECIMAL128, -2}}, 0, false};
     program.input_types        = program.output_types;
@@ -616,7 +617,7 @@ TEST_CASE("R4 Arrow empty and zero-column batches preserve cardinality", "[r4][s
     auto f               = std::make_shared<arrow_fixture>(released);
     f->schema.n_children = f->array.n_children = 0;
     f->array.length                            = rows;
-    auto owner = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner                                 = owned_fixture(f);
     materialization_program program{44, 1, {}, 0, false};
     program.input_types = std::vector<cudf::data_type>{};
     auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -682,7 +683,7 @@ TEST_CASE("R4 Arrow imports every flat primitive with nulls", "[r4][scan]")
       f->child.n_buffers = 3;
     }
     auto types = validate_arrow_host_flat(f->schema, f->array);
-    auto owner = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner = owned_fixture(f);
     materialization_program program{46, 1, types, 0, false};
     program.input_types = types;
     auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -771,7 +772,7 @@ TEST_CASE("R4 retiring an abandoned Arrow import releases its owner exactly once
   {
     sirius::exec::retire_lane lane(stream.value());
     auto f     = std::make_shared<arrow_fixture>(released);
-    auto owner = std::make_shared<owned_arrow_batch>(f->schema, f->array, f);
+    auto owner = owned_fixture(f);
     materialization_program program{47, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
     program.input_types = program.output_types;
     auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
@@ -800,7 +801,11 @@ TEST_CASE("R4 Arrow query drain retires cancelled batches and returns their cred
   auto capacity = std::make_shared<credit_token>(&credits);
   test_arrow_source source;
   source.queue.push_back(
-    {std::make_shared<owned_arrow_batch>(fixture->schema, fixture->array, capacity), 0, 3, 12});
+    {std::make_shared<owned_arrow_batch>(
+       fixture->schema, fixture->array, capacity, *std::pmr::new_delete_resource()),
+     0,
+     3,
+     12});
 
   materialization_program program{49, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
   program.input_types = program.output_types;
