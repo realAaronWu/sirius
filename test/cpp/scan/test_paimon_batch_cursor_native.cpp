@@ -471,14 +471,14 @@ TEST_CASE("Paimon bounds delegated planning opens before the next file",
   REQUIRE(local.ok());
   auto filesystem = std::make_shared<counted_parquet_filesystem>(std::move(local).value());
   std::vector<std::string> opens;
-  unsigned known_length_opens = 0;
-  unsigned data_opens         = 0;
-  filesystem->before_open     = [&](std::string const& path, bool known_length) {
+  std::vector<std::string> known_length_opens;
+  unsigned data_opens     = 0;
+  filesystem->before_open = [&](std::string const& path, bool known_length) {
     if (path.ends_with(".parquet")) {
       ++data_opens;
     } else {
       opens.push_back(path);
-      if (known_length) ++known_length_opens;
+      if (known_length) known_length_opens.push_back(path);
     }
     return paimon::Status::OK();
   };
@@ -502,8 +502,9 @@ TEST_CASE("Paimon bounds delegated planning opens before the next file",
   }
   REQUIRE(owners->pool->CurrentUsage() == 0);
   auto const ordinary_opens       = std::exchange(opens, {});
-  auto const known_length_control = std::exchange(known_length_opens, 0);
+  auto const known_length_control = std::exchange(known_length_opens, {});
   auto const manifest             = metadata.path + "/manifest/";
+  auto const schema               = metadata.path + "/schema/schema-0";
   std::vector<std::string> manifest_opens;
   for (auto const& path : ordinary_opens) {
     if (path.starts_with(manifest)) manifest_opens.push_back(path.substr(manifest.size()));
@@ -513,7 +514,11 @@ TEST_CASE("Paimon bounds delegated planning opens before the next file",
                                    "manifest-list-5a10e6e2-e185-4a19-81c4-a73cd717c9e9-1",
                                    "manifest-e52735ad-c894-4963-aa72-9431b6289634-0",
                                    "manifest-a1b91e17-ecd9-430e-83ea-7d63cefceed2-0"});
-  REQUIRE(known_length_control >= 2);
+  REQUIRE(known_length_control ==
+          std::vector<std::string>{manifest + manifest_opens[2], manifest + manifest_opens[3]});
+  REQUIRE(ordinary_opens.back() == known_length_control.back());
+  REQUIRE(std::count(ordinary_opens.begin(), ordinary_opens.end(), schema) == 2);
+  REQUIRE(ordinary_opens.size() == 11);
   REQUIRE(std::count(ordinary_opens.begin(),
                      ordinary_opens.end(),
                      metadata.path + "/snapshot/snapshot-2") == 1);
@@ -532,17 +537,20 @@ TEST_CASE("Paimon bounds delegated planning opens before the next file",
   }
   REQUIRE(opens ==
           std::vector<std::string>(ordinary_opens.begin(), ordinary_opens.begin() + below));
+  REQUIRE(known_length_opens.size() == (below == 0 ? 0 : 1));
   REQUIRE(data_opens == 0);
   REQUIRE(owners->pool->CurrentUsage() == 0);
 
   opens.clear();
-  known_length_opens = 0;
-  auto cursor        = open_paimon_read_with_planning_io(
+  known_length_opens.clear();
+  auto cursor = open_paimon_read_with_planning_io(
     metadata, {0}, owners->pool, owners, 1, {}, filesystem, exact);
   REQUIRE(cursor);
-  REQUIRE(opens.size() >= exact);
-  REQUIRE(known_length_opens >= known_length_control);
+  REQUIRE(opens.size() >= exact + 2);
+  REQUIRE(known_length_opens == known_length_control);
   REQUIRE(std::equal(ordinary_opens.begin(), ordinary_opens.end(), opens.begin()));
+  REQUIRE(std::all_of(
+    opens.begin() + exact, opens.end(), [&](std::string const& path) { return path == schema; }));
   std::vector<int64_t> rows;
   while (cursor->consume({}, 1, [&](ArrowSchema const& schema, ArrowArray const& batch) {
     append_ids(schema, batch, rows);
