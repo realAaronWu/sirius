@@ -21,6 +21,7 @@
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <duckdb/common/arrow/arrow.hpp>
+#include <paimon/executor.h>
 #include <paimon/fs/file_system_factory.h>
 #include <paimon/memory/memory_pool.h>
 #include <paimon/scan_context.h>
@@ -71,6 +72,13 @@ class fault_pool final : public paimon::MemoryPool {
 
  private:
   std::unique_ptr<paimon::MemoryPool> upstream;
+};
+
+class fixture_inline_executor final : public paimon::Executor {
+ public:
+  void Add(std::function<void()> task) override { task(); }
+  void ShutdownNow() override {}
+  uint32_t GetThreadNum() const override { return 1; }
 };
 
 struct parquet_stream_counts {
@@ -474,10 +482,47 @@ TEST_CASE("Paimon bounds delegated planning opens before the next file",
     }
     return paimon::Status::OK();
   };
-  // Stock reads three missing EARLIEST hints, LATEST, the bound snapshot, then two lists
-  // and two manifests. The cap also counts delegated attempts that return an error.
-  constexpr uint64_t exact = 9;
-  auto below               = GENERATE(uint64_t{0}, exact - 1);
+  // Get the attempt count independently of the limiter, ending before TableRead.
+  {
+    auto scan_context =
+      paimon::ScanContextBuilder(metadata.path)
+        .SetOptions(
+          {{"branch", "main"}, {"scan.mode", "from-snapshot-full"}, {"scan.snapshot-id", "2"}})
+        .SetTableSchema(metadata.schema_json)
+        .WithFileSystem(filesystem)
+        .WithExecutor(std::make_shared<fixture_inline_executor>())
+        .WithMemoryPool(owners->pool)
+        .Finish();
+    REQUIRE(scan_context.ok());
+    auto scan = paimon::TableScan::Create(std::move(scan_context).value());
+    REQUIRE(scan.ok());
+    auto plan = scan.value()->CreatePlan();
+    REQUIRE(plan.ok());
+    REQUIRE(plan.value()->SnapshotId() == 2);
+  }
+  REQUIRE(owners->pool->CurrentUsage() == 0);
+  auto const ordinary_opens       = std::exchange(opens, {});
+  auto const known_length_control = std::exchange(known_length_opens, 0);
+  auto const manifest             = metadata.path + "/manifest/";
+  std::vector<std::string> manifest_opens;
+  for (auto const& path : ordinary_opens) {
+    if (path.starts_with(manifest)) manifest_opens.push_back(path.substr(manifest.size()));
+  }
+  REQUIRE(manifest_opens ==
+          std::vector<std::string>{"manifest-list-5a10e6e2-e185-4a19-81c4-a73cd717c9e9-0",
+                                   "manifest-list-5a10e6e2-e185-4a19-81c4-a73cd717c9e9-1",
+                                   "manifest-e52735ad-c894-4963-aa72-9431b6289634-0",
+                                   "manifest-a1b91e17-ecd9-430e-83ea-7d63cefceed2-0"});
+  REQUIRE(known_length_control >= 2);
+  REQUIRE(std::count(ordinary_opens.begin(),
+                     ordinary_opens.end(),
+                     metadata.path + "/snapshot/snapshot-2") == 1);
+  REQUIRE(std::count(ordinary_opens.begin(),
+                     ordinary_opens.end(),
+                     metadata.path + "/snapshot/snapshot-1") == 0);
+  REQUIRE(data_opens == 0);
+  uint64_t const exact = ordinary_opens.size();
+  uint64_t const below = GENERATE(true, false) ? 0 : exact - 1;
   try {
     (void)open_paimon_read_with_planning_io(
       metadata, {0}, owners->pool, owners, 1, {}, filesystem, below);
@@ -485,7 +530,8 @@ TEST_CASE("Paimon bounds delegated planning opens before the next file",
   } catch (sirius::scan_manager::preparation_resource_error const& error) {
     REQUIRE(error.bound_exceeded);
   }
-  REQUIRE(opens.size() == below);
+  REQUIRE(opens ==
+          std::vector<std::string>(ordinary_opens.begin(), ordinary_opens.begin() + below));
   REQUIRE(data_opens == 0);
   REQUIRE(owners->pool->CurrentUsage() == 0);
 
@@ -494,16 +540,9 @@ TEST_CASE("Paimon bounds delegated planning opens before the next file",
   auto cursor        = open_paimon_read_with_planning_io(
     metadata, {0}, owners->pool, owners, 1, {}, filesystem, exact);
   REQUIRE(cursor);
-  REQUIRE(opens.size() == exact);
-  REQUIRE(known_length_opens == 2);
-  auto const manifest = metadata.path + "/manifest/";
-  REQUIRE(opens.at(4) == metadata.path + "/snapshot/snapshot-2");
-  REQUIRE(opens.at(5).starts_with(manifest + "manifest-list-"));
-  REQUIRE(opens.at(6).starts_with(manifest + "manifest-list-"));
-  REQUIRE(opens.at(7).starts_with(manifest + "manifest-"));
-  REQUIRE_FALSE(opens.at(7).starts_with(manifest + "manifest-list-"));
-  REQUIRE(opens.at(8).starts_with(manifest + "manifest-"));
-  REQUIRE_FALSE(opens.at(8).starts_with(manifest + "manifest-list-"));
+  REQUIRE(opens.size() >= exact);
+  REQUIRE(known_length_opens >= known_length_control);
+  REQUIRE(std::equal(ordinary_opens.begin(), ordinary_opens.end(), opens.begin()));
   std::vector<int64_t> rows;
   while (cursor->consume({}, 1, [&](ArrowSchema const& schema, ArrowArray const& batch) {
     append_ids(schema, batch, rows);
@@ -552,6 +591,7 @@ TEST_CASE("Paimon planning stop drains a real manifest open and preserves an ear
   REQUIRE(local.ok());
   auto filesystem = std::make_shared<counted_parquet_filesystem>(std::move(local).value());
   bool const fail = GENERATE(false, true);
+  constexpr uint64_t open_limit = 64;  // Leave retry headroom to isolate the stop behavior.
   std::stop_source stop;
   std::promise<void> entered, release;
   auto blocked            = entered.get_future();
@@ -574,7 +614,7 @@ TEST_CASE("Paimon planning stop drains a real manifest open and preserves an ear
       1,
       sirius::scan_manager::preparation_stop_token{stop.get_token()},
       filesystem,
-      9);
+      open_limit);
   });
   auto const reached = blocked.wait_for(5s) == std::future_status::ready;
   stop.request_stop();
@@ -597,8 +637,8 @@ TEST_CASE("Paimon planning stop drains a real manifest open and preserves an ear
   REQUIRE(owners->pool->CurrentUsage() == 0);
 
   filesystem->before_open = {};
-  auto cursor =
-    open_paimon_read_with_planning_io(metadata, {0}, owners->pool, owners, 1, {}, filesystem, 9);
+  auto cursor             = open_paimon_read_with_planning_io(
+    metadata, {0}, owners->pool, owners, 1, {}, filesystem, open_limit);
   REQUIRE(cursor);
   cursor.reset();
   REQUIRE(owners->pool->CurrentUsage() == 0);
