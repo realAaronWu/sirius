@@ -29,11 +29,14 @@
 #include <paimon/table/source/table_scan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -144,6 +147,8 @@ class counted_parquet_filesystem final : public paimon::FileSystem {
   {
   }
 
+  std::function<paimon::Status(std::string const&, bool)> before_open;
+
   std::pair<size_t, size_t> live_and_peak() const
   {
     std::lock_guard lock(_counts->mutex);
@@ -152,12 +157,21 @@ class counted_parquet_filesystem final : public paimon::FileSystem {
 
   paimon::Result<std::unique_ptr<paimon::InputStream>> Open(std::string const& path) const override
   {
+    if (before_open) {
+      auto status = before_open(path, false);
+      if (!status.ok()) return status;
+    }
     return track(path, _upstream->Open(path));
   }
   paimon::Result<std::unique_ptr<paimon::InputStream>> Open(
     paimon::FileStatus const& status) const override
   {
-    return track(status.GetPath(), _upstream->Open(status));
+    auto path = status.GetPath();
+    if (before_open) {
+      auto outcome = before_open(path, true);
+      if (!outcome.ok()) return outcome;
+    }
+    return track(path, _upstream->Open(status));
   }
   paimon::Result<std::unique_ptr<paimon::OutputStream>> Create(std::string const& path,
                                                                bool overwrite) const override
@@ -436,4 +450,156 @@ TEST_CASE("Paimon native read allocation refusal is terminal and drains",
   cursor->close();
   cursor.reset();
   REQUIRE(pool->CurrentUsage() == 0);
+}
+
+TEST_CASE("Paimon bounds delegated planning opens before the next file",
+          "[paimon_cursor][paimon_native][paimon_planning_io]")
+{
+  using namespace sirius::op::scan;
+  auto owners          = std::make_shared<native_fixture>();
+  auto metadata        = fixture_metadata();
+  metadata.snapshot_id = 2;
+  auto local           = paimon::FileSystemFactory::Get("local", metadata.path, {});
+  REQUIRE(local.ok());
+  auto filesystem = std::make_shared<counted_parquet_filesystem>(std::move(local).value());
+  std::vector<std::string> opens;
+  unsigned known_length_opens = 0;
+  unsigned data_opens         = 0;
+  filesystem->before_open     = [&](std::string const& path, bool known_length) {
+    if (path.ends_with(".parquet")) {
+      ++data_opens;
+    } else {
+      opens.push_back(path);
+      if (known_length) ++known_length_opens;
+    }
+    return paimon::Status::OK();
+  };
+  // Stock reads three missing EARLIEST hints, LATEST, the bound snapshot, then two lists
+  // and two manifests. The cap also counts delegated attempts that return an error.
+  constexpr uint64_t exact = 9;
+  auto below               = GENERATE(uint64_t{0}, exact - 1);
+  try {
+    (void)open_paimon_read_with_planning_io(
+      metadata, {0}, owners->pool, owners, 1, {}, filesystem, below);
+    FAIL("refused planning returned a cursor or EOF");
+  } catch (sirius::scan_manager::preparation_resource_error const& error) {
+    REQUIRE(error.bound_exceeded);
+  }
+  REQUIRE(opens.size() == below);
+  REQUIRE(data_opens == 0);
+  REQUIRE(owners->pool->CurrentUsage() == 0);
+
+  opens.clear();
+  known_length_opens = 0;
+  auto cursor        = open_paimon_read_with_planning_io(
+    metadata, {0}, owners->pool, owners, 1, {}, filesystem, exact);
+  REQUIRE(cursor);
+  REQUIRE(opens.size() == exact);
+  REQUIRE(known_length_opens == 2);
+  auto const manifest = metadata.path + "/manifest/";
+  REQUIRE(opens.at(4) == metadata.path + "/snapshot/snapshot-2");
+  REQUIRE(opens.at(5).starts_with(manifest + "manifest-list-"));
+  REQUIRE(opens.at(6).starts_with(manifest + "manifest-list-"));
+  REQUIRE(opens.at(7).starts_with(manifest + "manifest-"));
+  REQUIRE_FALSE(opens.at(7).starts_with(manifest + "manifest-list-"));
+  REQUIRE(opens.at(8).starts_with(manifest + "manifest-"));
+  REQUIRE_FALSE(opens.at(8).starts_with(manifest + "manifest-list-"));
+  std::vector<int64_t> rows;
+  while (cursor->consume({}, 1, [&](ArrowSchema const& schema, ArrowArray const& batch) {
+    append_ids(schema, batch, rows);
+  })) {}
+  std::sort(rows.begin(), rows.end());
+  REQUIRE(rows == std::vector<int64_t>{1, 1, 2, 3});
+  REQUIRE(data_opens == 2);
+  cursor.reset();
+  REQUIRE(owners->pool->CurrentUsage() == 0);
+}
+
+TEST_CASE("Paimon planning I/O preserves a missing bound snapshot failure",
+          "[paimon_cursor][paimon_native][paimon_planning_io]")
+{
+  using namespace sirius::op::scan;
+  auto owners   = std::make_shared<native_fixture>();
+  auto metadata = fixture_metadata();  // Numbered snapshot 1; snapshot 2 is latest.
+  auto local    = paimon::FileSystemFactory::Get("local", metadata.path, {});
+  REQUIRE(local.ok());
+  auto filesystem = std::make_shared<counted_parquet_filesystem>(std::move(local).value());
+  std::vector<std::string> opens;
+  auto const bound        = metadata.path + "/snapshot/snapshot-1";
+  filesystem->before_open = [&](std::string const& path, bool) {
+    opens.push_back(path);
+    if (path == bound) return paimon::Status::NotExist("bound snapshot missing witness");
+    return paimon::Status::OK();
+  };
+  REQUIRE_THROWS_WITH(
+    open_paimon_read_with_planning_io(metadata, {0}, owners->pool, owners, 1, {}, filesystem, 9),
+    Catch::Matchers::ContainsSubstring("bound snapshot missing witness"));
+  REQUIRE(std::count(opens.begin(), opens.end(), bound) == 1);
+  auto const latest = metadata.path + "/snapshot/snapshot-2";
+  REQUIRE(std::count(opens.begin(), opens.end(), latest) == 0);
+  REQUIRE(owners->pool->CurrentUsage() == 0);
+}
+
+TEST_CASE("Paimon planning stop drains a real manifest open and preserves an earlier I/O failure",
+          "[paimon_cursor][paimon_native][paimon_planning_io]")
+{
+  using namespace sirius::op::scan;
+  using namespace std::chrono_literals;
+  auto owners          = std::make_shared<native_fixture>();
+  auto metadata        = fixture_metadata();
+  metadata.snapshot_id = 2;
+  auto local           = paimon::FileSystemFactory::Get("local", metadata.path, {});
+  REQUIRE(local.ok());
+  auto filesystem = std::make_shared<counted_parquet_filesystem>(std::move(local).value());
+  bool const fail = GENERATE(false, true);
+  std::stop_source stop;
+  std::promise<void> entered, release;
+  auto blocked            = entered.get_future();
+  auto resume             = release.get_future();
+  int list_opens          = 0;
+  filesystem->before_open = [&](std::string const& path, bool) {
+    if (path.starts_with(metadata.path + "/manifest/manifest-list-") && ++list_opens == 1) {
+      entered.set_value();
+      resume.wait();
+      if (fail) return paimon::Status::IOError("first manifest I/O witness");
+    }
+    return paimon::Status::OK();
+  };
+  auto planning      = std::async(std::launch::async, [&] {
+    return open_paimon_read_with_planning_io(
+      metadata,
+      {0},
+      owners->pool,
+      owners,
+      1,
+      sirius::scan_manager::preparation_stop_token{stop.get_token()},
+      filesystem,
+      9);
+  });
+  auto const reached = blocked.wait_for(5s) == std::future_status::ready;
+  stop.request_stop();
+  auto const still_running = planning.wait_for(0s) == std::future_status::timeout;
+  release.set_value();
+  REQUIRE(reached);
+  REQUIRE(still_running);
+  try {
+    (void)planning.get();
+    FAIL("stopped planning returned a cursor or EOF");
+  } catch (std::system_error const& error) {
+    REQUIRE_FALSE(fail);
+    REQUIRE(error.code() == std::errc::operation_canceled);
+  } catch (std::runtime_error const& error) {
+    REQUIRE(fail);
+    REQUIRE(std::string_view(error.what()).find("first manifest I/O witness") !=
+            std::string_view::npos);
+  }
+  REQUIRE(list_opens == 1);
+  REQUIRE(owners->pool->CurrentUsage() == 0);
+
+  filesystem->before_open = {};
+  auto cursor =
+    open_paimon_read_with_planning_io(metadata, {0}, owners->pool, owners, 1, {}, filesystem, 9);
+  REQUIRE(cursor);
+  cursor.reset();
+  REQUIRE(owners->pool->CurrentUsage() == 0);
 }

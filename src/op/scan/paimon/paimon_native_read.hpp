@@ -40,4 +40,17 @@ std::unique_ptr<paimon_batch_cursor> open_paimon_read(
   int64_t max_batch_rows,
   scan_manager::preparation_stop_token,
   std::shared_ptr<paimon::FileSystem> filesystem = {});
+
+// On the authenticated numbered local route, count delegated planning Open attempts,
+// including errors. Zero admits none. Stop is observed at filesystem dispatch; an
+// operation admitted before stop may complete. Data reads use the original filesystem.
+std::unique_ptr<paimon_batch_cursor> open_paimon_read_with_planning_io(
+  paimon_read_metadata const&,
+  std::vector<int32_t> const& stable_field_ids,
+  std::shared_ptr<paimon::MemoryPool>,
+  std::shared_ptr<void> native_modules,
+  int64_t max_batch_rows,
+  scan_manager::preparation_stop_token,
+  std::shared_ptr<paimon::FileSystem> filesystem,
+  uint64_t max_planning_open_attempts);
 }  // namespace sirius::op::scan
