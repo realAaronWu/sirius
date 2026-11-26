@@ -33,12 +33,15 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <system_error>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -546,13 +549,26 @@ TEST_CASE("Stock Paimon native readers draw column buffers from retained stateme
     auto refused          = right_pool->capacity_refusals();
     unsigned publications = 0;
     auto consume          = [&] {
-      return right->consume({}, 1, [&](ArrowSchema const&, ArrowArray const&) { ++publications; });
+      std::exception_ptr failure;
+      std::string diagnostic;
+      try {
+        (void)right->consume({}, 1, [&](ArrowSchema const&, ArrowArray const&) { ++publications; });
+      } catch (std::bad_alloc const& error) {
+        // The stock reader lets this allocation refusal escape directly from NextBatch.
+        REQUIRE(typeid(error) == typeid(std::bad_alloc));
+        failure    = std::current_exception();
+        diagnostic = error.what();
+      }
+      REQUIRE(failure);
+      return std::pair{failure, diagnostic};
     };
-    REQUIRE_THROWS(consume());
+    auto first = consume();
     REQUIRE(right_pool->capacity_refusals() > refused);
     REQUIRE(publications == 0);
-    refused = right_pool->capacity_refusals();
-    REQUIRE_THROWS(consume());
+    refused     = right_pool->capacity_refusals();
+    auto repeat = consume();
+    REQUIRE(repeat.first == first.first);
+    REQUIRE(repeat.second == first.second);
     REQUIRE(right_pool->capacity_refusals() == refused);
     REQUIRE(publications == 0);
     REQUIRE(provider.seen->allocations == 2);
