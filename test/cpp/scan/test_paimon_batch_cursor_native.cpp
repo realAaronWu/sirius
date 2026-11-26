@@ -448,7 +448,8 @@ TEST_CASE("Stock Paimon native readers draw column buffers from retained stateme
   namespace sm = sirius::scan_manager;
   using sirius::op::scan::open_paimon_read;
   using sirius::op::scan::detail::paimon_admitted_pool;
-  constexpr uint64_t bytes = 1 << 20;
+  // Stock planning needs a 1 MiB Avro input buffer plus arena overhead and other live allocations.
+  constexpr uint64_t bytes = 4 << 20;
   constexpr sm::unit_key first{1, 0}, second{2, 0};
   sm::test::test_reservation_provider provider;
   provider.grant_bytes = 2 * bytes;
