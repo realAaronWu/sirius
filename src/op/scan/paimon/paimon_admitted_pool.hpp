@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -17,11 +16,6 @@
 #include <utility>
 
 namespace sirius::op::scan::detail {
-// Invariant diagnostics do not create an uncharged owning string in this allocator.
-class paimon_pool_request_error final : public std::exception {
- public:
-  char const* what() const noexcept override { return "Invalid Paimon pool pointer/size"; }
-};
 // Adapts an existing retained statement block to the stock SDK MemoryPool.
 // The pool and block descriptors live in the backing. The shared control block
 // and SDK allocations outside this pool require separate accounting.
@@ -40,10 +34,11 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
     auto align = normalize_alignment(alignment);
     std::lock_guard lock(mutex_);
     if (!pointer) {
-      if (old_size) throw paimon_pool_request_error{};
+      if (old_size) throw std::bad_alloc();
       return allocate(new_size, align);
     }
     auto* old = find(pointer, old_size);
+    if (!old) throw std::bad_alloc();
     if (!new_size) {
       release(old);
       return nullptr;
@@ -55,22 +50,38 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
     release(old);
     return replacement;
   }
-  void Free(void* pointer, uint64_t bytes) override
+  void Free(void* pointer, uint64_t bytes) noexcept override
   {
     std::lock_guard lock(mutex_);
     if (!pointer && !bytes) return;
-    release(find(pointer, bytes));
+    if (auto* entry = find(pointer, bytes)) {
+      release(entry);
+      return;
+    }
+    // SDK destructors call Free. Keep the allocation charged until a valid
+    // Free or arena teardown, because a bad request cannot identify a live block.
+    if (invalid_frees_ != UINT64_MAX) ++invalid_frees_;
   }
-  void Free(void* pointer, uint64_t bytes, uint64_t) override { Free(pointer, bytes); }
+  void Free(void* pointer, uint64_t bytes, uint64_t) noexcept override { Free(pointer, bytes); }
   uint64_t CurrentUsage() const override
   {
     std::lock_guard lock(mutex_);
-    return used_;
+    return occupied_;
   }
   uint64_t MaxMemoryUsage() const override
   {
     std::lock_guard lock(mutex_);
-    return maximum_;
+    return peak_occupied_;
+  }
+  uint64_t invalid_free_requests() const
+  {
+    std::lock_guard lock(mutex_);
+    return invalid_frees_;
+  }
+  uint64_t peak_live_allocations() const
+  {
+    std::lock_guard lock(mutex_);
+    return peak_live_;
   }
   uint64_t capacity_refusals() const
   {
@@ -140,22 +151,24 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
       }
       available->requested = static_cast<size_t>(bytes);
       available->data      = data;
-      used_ += bytes;
-      maximum_ = std::max(maximum_, used_);
+      occupied_ += available->extent;
+      peak_occupied_ = std::max(peak_occupied_, occupied_);
+      peak_live_     = std::max(peak_live_, ++live_);
       return data;
     }
     refuse();
   }
-  block* find(void* pointer, uint64_t bytes)
+  block* find(void* pointer, uint64_t bytes) noexcept
   {
     // Never inspect storage before a caller pointer. The descriptors are our own bounded list.
     for (auto* entry = first_; entry; entry = entry->next)
       if (entry->data && entry->data == pointer && entry->requested == bytes) return entry;
-    throw paimon_pool_request_error{};
+    return nullptr;
   }
   void release(block* entry) noexcept
   {
-    used_ -= entry->requested;
+    occupied_ -= entry->extent;
+    --live_;
     entry->data      = nullptr;
     entry->requested = 0;
     if (entry->next && !entry->next->data) {
@@ -175,8 +188,11 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
   }
   mutable std::mutex mutex_;
   block* first_;
-  // Requested bytes only. Alignment and descriptors share the same backing.
-  uint64_t used_ = 0, maximum_ = 0, refusals_ = 0;
+  // Occupied extents include headers, padding and unsplittable tails.
+  // The ledger charges the entire retained backing, including free extents.
+  uint64_t occupied_ = 0, peak_occupied_ = 0;
+  uint64_t live_ = 0, peak_live_ = 0;
+  uint64_t refusals_ = 0, invalid_frees_ = 0;
 };
 
 inline std::shared_ptr<paimon_admitted_pool> paimon_admitted_pool::create(
