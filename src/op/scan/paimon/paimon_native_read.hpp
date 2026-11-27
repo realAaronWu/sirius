@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace paimon {
@@ -27,17 +28,20 @@ class FileSystem;
 class MemoryPool;
 }  // namespace paimon
 namespace sirius::op::scan {
+struct paimon_native_controls {
+  std::shared_ptr<paimon::FileSystem> filesystem;
+  // Caller-provided logical file size limit for the bound numbered snapshot.
+  std::optional<uint64_t> max_snapshot_bytes;
+};
+
 // Run on the serialized native lane, after provider authentication and resource admission.
-// pool bounds only allocations routed through it; this function establishes no all-native quota.
-// An explicit filesystem is shared by planning and reading. No Sirius Parquet cache
-// identity or background prefetch is shared. Native owners outlive reader/root cleanup.
-// Null means validated empty-at-bind or a genuinely empty retained plan, never an SDK error.
-std::unique_ptr<paimon_batch_cursor> open_paimon_read(
-  paimon_read_metadata const&,
-  std::vector<int32_t> const& stable_field_ids,
-  std::shared_ptr<paimon::MemoryPool>,
-  std::shared_ptr<void> native_modules,
-  int64_t max_batch_rows,
-  scan_manager::preparation_stop_token,
-  std::shared_ptr<paimon::FileSystem> filesystem = {});
+// The pool bounds allocations routed through it. Read setup and data I/O use the original
+// filesystem. Accepted planning I/O can finish; stop is checked before subsequent dispatch.
+std::unique_ptr<paimon_batch_cursor> open_paimon_read(paimon_read_metadata const&,
+                                                      std::vector<int32_t> const& stable_field_ids,
+                                                      std::shared_ptr<paimon::MemoryPool>,
+                                                      std::shared_ptr<void> native_modules,
+                                                      int64_t max_batch_rows,
+                                                      scan_manager::preparation_stop_token,
+                                                      paimon_native_controls const& = {});
 }  // namespace sirius::op::scan
