@@ -15,10 +15,12 @@
  */
 
 #include "catch.hpp"
+#include "op/scan/paimon/paimon_admitted_pool.hpp"
 #include "op/scan/paimon/paimon_batch_cursor.hpp"
 #include "op/scan/paimon/paimon_native_read.hpp"
 #include "scan/paimon_native_test_fixture.hpp"
 #include "scan_manager/preparation_ledger.hpp"
+#include "scan_manager/preparation_test_support.hpp"
 
 #include <duckdb/common/arrow/arrow.hpp>
 #include <paimon/fs/file_system_factory.h>
@@ -29,12 +31,19 @@
 #include <paimon/table/source/table_scan.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <exception>
 #include <functional>
 #include <mutex>
+#include <new>
+#include <random>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <system_error>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -435,5 +444,321 @@ TEST_CASE("Paimon native read allocation refusal is terminal and drains",
   REQUIRE(pool->attempts == failures);
   cursor->close();
   cursor.reset();
+  REQUIRE(pool->CurrentUsage() == 0);
+}
+
+TEST_CASE("Stock Paimon native readers draw column buffers from retained statement backing",
+          "[paimon_cursor][paimon_native][paimon_admitted_pool]")
+{
+  namespace sm = sirius::scan_manager;
+  using sirius::op::scan::open_paimon_read;
+  using sirius::op::scan::detail::paimon_admitted_pool;
+  // Stock planning needs a 1 MiB Avro input buffer plus arena overhead and other live allocations.
+  constexpr uint64_t bytes = 4 << 20;
+  constexpr sm::unit_key first{1, 0}, second{2, 0};
+  sm::test::test_reservation_provider provider;
+  provider.grant_bytes = 2 * bytes;
+  sm::preparation_ledger ledger(provider);
+  std::array scans{sm::scan_envelope{{{{}, bytes}}, {}, true},
+                   sm::scan_envelope{{{{}, bytes}}, {}, true}};
+  auto decision = ledger.admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0});
+  REQUIRE(decision.deferred);
+  REQUIRE(decision.sigma_retained == 2 * bytes);
+
+  auto make_pool = [&](sm::unit_key key) {
+    auto permit = ledger.try_acquire_unit(key, bytes);
+    REQUIRE(permit);
+    auto backing = ledger.allocator(permit).allocate_retained(bytes);
+    auto begin   = reinterpret_cast<uintptr_t>(backing.data());
+    return std::pair{paimon_admitted_pool::create(std::move(backing)), begin};
+  };
+  auto [left_pool, left_begin]   = make_pool(first);
+  auto [right_pool, right_begin] = make_pool(second);
+  REQUIRE(ledger.permits_in_flight() == 0);
+  REQUIRE(provider.seen->allocated_bytes == 2 * bytes);
+  {
+    auto permit = ledger.acquire_permit(second);
+    REQUIRE(permit);
+    try {
+      ledger.allocator(permit).allocate_retained(1);
+      FAIL("second source exceeded its retained grant");
+    } catch (sm::preparation_resource_error const& error) {
+      REQUIRE(error.bound_exceeded);
+    }
+    CHECK(ledger.bound_exceeded() == 1);
+    CHECK(provider.seen->allocations == 2);
+  }
+
+  auto modules              = std::make_shared<native_fixture>();
+  auto metadata             = fixture_metadata();
+  metadata.snapshot_id      = 2;
+  auto const planning_start = std::chrono::steady_clock::now();
+  auto left                 = open_paimon_read(metadata, {0}, left_pool, modules, 1, {});
+  auto right                = open_paimon_read(metadata, {0}, right_pool, modules, 1, {});
+  REQUIRE(left);
+  REQUIRE(right);
+  auto const planning_elapsed = std::chrono::steady_clock::now() - planning_start;
+  auto const planning_peak    = right_pool->peak_live_allocations();
+  auto const reading_start    = std::chrono::steady_clock::now();
+
+  left_pool.reset();
+  std::vector<int64_t> left_values, right_values;
+  auto read = [&](auto& cursor, uintptr_t begin, std::vector<int64_t>& values) {
+    return cursor.consume({}, 1, [&](ArrowSchema const& schema, ArrowArray const& array) {
+      REQUIRE(array.length == 1);
+      for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (std::string_view(schema.children[i]->name) != "id") continue;
+        auto const& column = *array.children[i];
+        REQUIRE(column.offset == 0);
+        REQUIRE(column.n_buffers == 2);
+        auto* value  = static_cast<int64_t const*>(column.buffers[1]);
+        auto address = reinterpret_cast<uintptr_t>(value);
+        REQUIRE(address >= begin);
+        REQUIRE(address - begin <= bytes - sizeof(*value));
+        CHECK(ledger.charged_bytes(first) + ledger.charged_bytes(second) == 2 * bytes);
+        CHECK(provider.seen->allocated_bytes == 2 * bytes);
+        REQUIRE(values.size() < 4);
+        values.push_back(*value);
+        return;
+      }
+      FAIL("stock Paimon batch had no retained id field");
+    });
+  };
+  REQUIRE(read(*left, left_begin, left_values));
+
+  SECTION("both live readers return the exact snapshot and retire their own backing")
+  {
+    REQUIRE(read(*right, right_begin, right_values));
+    while (read(*left, left_begin, left_values)) {}
+    while (read(*right, right_begin, right_values)) {}
+  }
+  SECTION("physical exhaustion before the second reader can deliver a batch")
+  {
+    struct hold {
+      paimon_admitted_pool& pool;
+      uint64_t size;
+      void* data;
+      hold(paimon_admitted_pool& pool, uint64_t size)
+        : pool(pool), size(size), data(pool.Malloc(size))
+      {
+      }
+      ~hold() { pool.Free(data, size); }
+    };
+    std::vector<std::unique_ptr<hold>> pressure;
+    for (uint64_t size = bytes; size; size /= 2) {
+      try {
+        for (;;)
+          pressure.emplace_back(std::make_unique<hold>(*right_pool, size));
+      } catch (std::bad_alloc const&) {
+      }
+    }
+    auto refused          = right_pool->capacity_refusals();
+    unsigned publications = 0;
+    auto consume          = [&] {
+      std::exception_ptr failure;
+      std::string diagnostic;
+      try {
+        (void)right->consume({}, 1, [&](ArrowSchema const&, ArrowArray const&) { ++publications; });
+      } catch (std::bad_alloc const& error) {
+        // The stock reader lets this allocation refusal escape directly from NextBatch.
+        REQUIRE(typeid(error) == typeid(std::bad_alloc));
+        failure    = std::current_exception();
+        diagnostic = error.what();
+      }
+      REQUIRE(failure);
+      return std::pair{failure, diagnostic};
+    };
+    auto first = consume();
+    REQUIRE(right_pool->capacity_refusals() > refused);
+    REQUIRE(publications == 0);
+    refused     = right_pool->capacity_refusals();
+    auto repeat = consume();
+    REQUIRE(repeat.first == first.first);
+    REQUIRE(repeat.second == first.second);
+    REQUIRE(right_pool->capacity_refusals() == refused);
+    REQUIRE(publications == 0);
+    REQUIRE(provider.seen->allocations == 2);
+    pressure.clear();
+
+    // The terminal reader cannot retry. An independent source and a fresh cursor can.
+    while (read(*left, left_begin, left_values)) {}
+    right->close();
+    right.reset();
+    REQUIRE(right_pool->CurrentUsage() == 0);
+    right = open_paimon_read(metadata, {0}, right_pool, modules, 1, {});
+    REQUIRE(right);
+    while (read(*right, right_begin, right_values)) {}
+  }
+
+  for (auto* values : {&left_values, &right_values}) {
+    std::sort(values->begin(), values->end());
+    REQUIRE(*values == std::vector<int64_t>{1, 1, 2, 3});
+  }
+
+  INFO("two opens in microseconds: "
+       << std::chrono::duration_cast<std::chrono::microseconds>(planning_elapsed).count());
+  INFO("reading and retirement scenario in microseconds: "
+       << std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                reading_start)
+            .count());
+  CAPTURE(planning_peak, right_pool->peak_live_allocations(), right_pool->MaxMemoryUsage());
+  CHECK(planning_peak > 0);
+  CHECK(right_pool->invalid_free_requests() == 0);
+
+  left->close();
+  REQUIRE(ledger.charged_bytes(first) == bytes);
+  left.reset();
+  REQUIRE(ledger.charged_bytes(first) == 0);
+  REQUIRE(ledger.charged_bytes(second) == bytes);
+  REQUIRE(provider.seen->allocated_bytes == bytes);
+  right->close();
+  right.reset();
+  REQUIRE(right_pool->CurrentUsage() == 0);
+  right_pool.reset();
+  REQUIRE(ledger.charged_bytes(second) == 0);
+  REQUIRE(provider.seen->allocated_bytes == 0);
+  ledger.retire_unit(first);
+  ledger.retire_unit(second);
+  REQUIRE(ledger.tracked_units() == 0);
+}
+
+TEST_CASE("Paimon admitted reallocation preserves the old buffer on physical exhaustion",
+          "[paimon_cursor][paimon_admitted_pool]")
+{
+  namespace sm = sirius::scan_manager;
+  using sirius::op::scan::detail::paimon_admitted_pool;
+  constexpr uint64_t bytes = 8192;
+  constexpr sm::unit_key key{1, 0};
+  sm::test::test_reservation_provider provider;
+  provider.grant_bytes = bytes;
+  sm::preparation_ledger ledger(provider);
+  std::array scans{sm::scan_envelope{{{{}, bytes}}, {}, true}};
+  REQUIRE(ledger.admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}).deferred);
+  auto permit = ledger.try_acquire_unit(key, bytes);
+  REQUIRE(permit);
+  auto pool = paimon_admitted_pool::create(ledger.allocator(permit).allocate_retained(bytes));
+  permit.release();
+
+  constexpr size_t old_size = bytes / 3, new_size = old_size * 2;
+  auto* old = static_cast<char*>(pool->Malloc(old_size, 256));
+  REQUIRE(reinterpret_cast<uintptr_t>(old) % 256 == 0);
+  std::memset(old, 0x5a, old_size);
+  REQUIRE_THROWS_AS(pool->Realloc(old, old_size, new_size, 256), std::bad_alloc);
+  auto const old_extent = pool->CurrentUsage();
+  CHECK(old_extent > old_size);
+  CHECK(pool->MaxMemoryUsage() == old_extent);
+  int unrelated = 0;
+  pool->Free(old, old_size - 1);
+  CHECK(pool->invalid_free_requests() == 1);
+  pool->Free(&unrelated, sizeof(unrelated), 64);
+  CHECK(pool->invalid_free_requests() == 2);
+  pool->Free(old + 16, old_size - 16);
+  pool->Free(old + 1, old_size - 1);
+  CHECK(pool->invalid_free_requests() == 4);
+  CHECK(pool->CurrentUsage() == old_extent);
+  REQUIRE_THROWS_AS(pool->Realloc(nullptr, 1, 8), std::bad_alloc);
+  REQUIRE_THROWS_AS(pool->Realloc(&unrelated, sizeof(unrelated), 8), std::bad_alloc);
+  REQUIRE_THROWS_AS(pool->Realloc(old, old_size - 1, 8), std::bad_alloc);
+  CHECK(pool->CurrentUsage() == old_extent);
+  CHECK(std::all_of(old, old + old_size, [](char value) { return value == 0x5a; }));
+  REQUIRE_THROWS_AS(pool->Realloc(old + 16, old_size - 16, 8), std::bad_alloc);
+  pool->Free(old, old_size);
+  pool->Free(old, old_size);
+  CHECK(pool->invalid_free_requests() == 5);
+  // The larger request alone fits. The refused peak came from the live overlap.
+  auto* larger = pool->Malloc(new_size, 256);
+  REQUIRE(larger != nullptr);
+  pool->Free(larger, new_size, 256);
+  REQUIRE(pool->CurrentUsage() == 0);
+  CHECK(provider.seen->allocations == 1);
+  pool.reset();
+  REQUIRE(provider.seen->allocated_bytes == 0);
+  REQUIRE(ledger.charged_bytes(key) == 0);
+}
+
+TEST_CASE("Paimon admitted pool preserves aligned live allocations under mixed requests",
+          "[paimon_cursor][paimon_admitted_pool]")
+{
+  namespace sm = sirius::scan_manager;
+  using sirius::op::scan::detail::paimon_admitted_pool;
+  constexpr uint64_t bytes = 128 << 10;
+  constexpr sm::unit_key key{1, 0};
+  sm::test::test_reservation_provider provider;
+  provider.grant_bytes = bytes;
+  sm::preparation_ledger ledger(provider);
+  std::array scans{sm::scan_envelope{{{{}, bytes}}, {}, true}};
+  REQUIRE(ledger.admit(scans, sm::memory_space_id{cucascade::memory::Tier::HOST, 0}).deferred);
+  auto permit = ledger.try_acquire_unit(key, bytes);
+  REQUIRE(permit);
+  auto pool = paimon_admitted_pool::create(ledger.allocator(permit).allocate_retained(bytes));
+  permit.release();
+
+  REQUIRE(pool->Malloc(0) == nullptr);
+  REQUIRE_THROWS_AS(pool->Malloc(1, 3), std::bad_alloc);
+  auto* small = static_cast<unsigned char*>(pool->Malloc(11, 1));
+  std::memset(small, 0x4b, 11);
+  auto* aligned = static_cast<unsigned char*>(pool->Realloc(small, 11, 11, 4096));
+  REQUIRE(reinterpret_cast<uintptr_t>(aligned) % 4096 == 0);
+  REQUIRE(std::all_of(aligned, aligned + 11, [](auto c) { return c == 0x4b; }));
+  REQUIRE(pool->Realloc(aligned, 11, 0) == nullptr);
+
+  auto const seed = GENERATE(17u, 1481u, 88933u);
+  std::mt19937 rng(seed);
+  constexpr std::array<uint64_t, 4> alignments{1, 8, 64, 4096};
+  struct allocation {
+    unsigned char* data   = nullptr;
+    size_t bytes          = 0;
+    unsigned char pattern = 0;
+  };
+  std::array<allocation, 256> live{};
+  auto verify = [](allocation const& item) {
+    if (item.data)
+      REQUIRE(
+        std::all_of(item.data, item.data + item.bytes, [&](auto c) { return c == item.pattern; }));
+  };
+  unsigned successes = 0;
+  for (unsigned i = 0; i < 100'000; ++i) {
+    auto& item = live[rng() % live.size()];
+    verify(item);
+    if (item.data && rng() % 4 == 0) {
+      pool->Free(item.data, item.bytes);
+      item = {};
+      continue;
+    }
+    auto const size      = 1 + rng() % 1024;
+    auto const alignment = alignments[rng() % alignments.size()];
+    auto const occupied  = pool->CurrentUsage();
+    unsigned char* data;
+    try {
+      data = static_cast<unsigned char*>(pool->Realloc(item.data, item.bytes, size, alignment));
+    } catch (std::bad_alloc const&) {
+      REQUIRE(pool->CurrentUsage() == occupied);
+      verify(item);
+      continue;
+    }
+    REQUIRE(data);
+    REQUIRE(reinterpret_cast<uintptr_t>(data) % alignment == 0);
+    if (item.data)
+      REQUIRE(std::all_of(data,
+                          data + std::min(item.bytes, static_cast<size_t>(size)),
+                          [&](auto c) { return c == item.pattern; }));
+    auto const pattern = static_cast<unsigned char>(1 + rng() % 255);
+    std::memset(data, pattern, size);
+    item = {data, static_cast<size_t>(size), pattern};
+    ++successes;
+  }
+  REQUIRE(successes > 1'000);
+  REQUIRE(pool->capacity_refusals() > 0);
+  for (auto const& item : live) {
+    verify(item);
+    if (item.data) pool->Free(item.data, item.bytes);
+  }
+  REQUIRE(pool->CurrentUsage() == 0);
+  REQUIRE(pool->invalid_free_requests() == 0);
+  // This can fit only after the occupied and free extents have coalesced.
+  constexpr auto near_full = bytes * 31 / 32;
+  auto* whole              = pool->Malloc(near_full);
+  REQUIRE(pool->CurrentUsage() > near_full);
+  pool->Free(whole, near_full);
   REQUIRE(pool->CurrentUsage() == 0);
 }
