@@ -652,13 +652,19 @@ TEST_CASE("Paimon admitted reallocation preserves the old buffer on physical exh
   CHECK(pool->invalid_free_requests() == 1);
   pool->Free(&unrelated, sizeof(unrelated), 64);
   CHECK(pool->invalid_free_requests() == 2);
+  pool->Free(old + 16, old_size - 16);
+  pool->Free(old + 1, old_size - 1);
+  CHECK(pool->invalid_free_requests() == 4);
   CHECK(pool->CurrentUsage() == old_extent);
   REQUIRE_THROWS_AS(pool->Realloc(nullptr, 1, 8), std::bad_alloc);
   REQUIRE_THROWS_AS(pool->Realloc(&unrelated, sizeof(unrelated), 8), std::bad_alloc);
   REQUIRE_THROWS_AS(pool->Realloc(old, old_size - 1, 8), std::bad_alloc);
   CHECK(pool->CurrentUsage() == old_extent);
   CHECK(std::all_of(old, old + old_size, [](char value) { return value == 0x5a; }));
+  REQUIRE_THROWS_AS(pool->Realloc(old + 16, old_size - 16, 8), std::bad_alloc);
   pool->Free(old, old_size);
+  pool->Free(old, old_size);
+  CHECK(pool->invalid_free_requests() == 5);
   // The larger request alone fits. The refused peak came from the live overlap.
   auto* larger = pool->Malloc(new_size, 256);
   REQUIRE(larger != nullptr);
@@ -750,8 +756,9 @@ TEST_CASE("Paimon admitted pool preserves aligned live allocations under mixed r
   REQUIRE(pool->CurrentUsage() == 0);
   REQUIRE(pool->invalid_free_requests() == 0);
   // This can fit only after the occupied and free extents have coalesced.
-  auto* whole = pool->Malloc(bytes - 512);
-  REQUIRE(pool->CurrentUsage() > bytes - 512);
-  pool->Free(whole, bytes - 512);
+  constexpr auto near_full = bytes * 31 / 32;
+  auto* whole              = pool->Malloc(near_full);
+  REQUIRE(pool->CurrentUsage() > near_full);
+  pool->Free(whole, near_full);
   REQUIRE(pool->CurrentUsage() == 0);
 }

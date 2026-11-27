@@ -6,6 +6,8 @@
 #include <paimon/memory/memory_pool.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -40,14 +42,14 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
     auto* old = find(pointer, old_size);
     if (!old) throw std::bad_alloc();
     if (!new_size) {
-      release(old);
+      release(old, pointer);
       return nullptr;
     }
     if (new_size == old_size && reinterpret_cast<uintptr_t>(pointer) % align == 0) return pointer;
     // Allocate while old is still occupied. Refusal leaves its extent/data untouched.
     auto* replacement = allocate(new_size, align);
     std::memcpy(replacement, pointer, std::min(old_size, new_size));
-    release(old);
+    release(old, pointer);
     return replacement;
   }
   void Free(void* pointer, uint64_t bytes) noexcept override
@@ -55,7 +57,7 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
     std::lock_guard lock(mutex_);
     if (!pointer && !bytes) return;
     if (auto* entry = find(pointer, bytes)) {
-      release(entry);
+      release(entry, pointer);
       return;
     }
     // SDK destructors call Free. Keep the allocation charged until a valid
@@ -102,13 +104,46 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
   struct block {
     block* previous;
     block* next;
-    size_t extent;  // Header, alignment padding and data, including any unsplittable tail.
-    size_t requested;
-    void* data;  // Null is free; zero-byte requests never consume a block.
+    size_t extent;     // Header, alignment padding and data, including any unsplittable tail.
+    size_t requested;  // Zero identifies free blocks, since zero-byte requests use no block.
+    block* previous_free = nullptr;
+    block* next_free     = nullptr;
   };
-  explicit paimon_admitted_pool(void* storage, size_t bytes)
-    : first_(::new(storage) block{nullptr, nullptr, bytes, 0, nullptr})
+  static constexpr size_t start_alignment = alignof(block*);
+  static constexpr size_t bits_per_byte   = std::numeric_limits<unsigned char>::digits;
+
+  explicit paimon_admitted_pool(std::byte* starts, void* storage, size_t bytes)
+    : live_starts_(starts), arena_start_(reinterpret_cast<uintptr_t>(storage)), arena_size_(bytes)
   {
+    insert_free(::new (storage) block{nullptr, nullptr, bytes, 0});
+  }
+
+  static size_t size_class(size_t extent) noexcept { return std::bit_width(extent) - 1; }
+
+  void insert_free(block* entry) noexcept
+  {
+    auto const group     = size_class(entry->extent);
+    entry->previous_free = nullptr;
+    entry->next_free     = free_lists_[group];
+    if (entry->next_free) entry->next_free->previous_free = entry;
+    free_lists_[group] = entry;
+    nonempty_lists_ |= size_t{1} << group;
+  }
+
+  void remove_free(block* entry, size_t group) noexcept
+  {
+    if (entry->previous_free)
+      entry->previous_free->next_free = entry->next_free;
+    else
+      free_lists_[group] = entry->next_free;
+    if (entry->next_free) entry->next_free->previous_free = entry->previous_free;
+    if (!free_lists_[group]) nonempty_lists_ &= ~(size_t{1} << group);
+  }
+
+  std::byte& start_byte(size_t slot) const noexcept { return live_starts_[slot / bits_per_byte]; }
+  static std::byte start_mask(size_t slot) noexcept
+  {
+    return std::byte{1} << (slot % bits_per_byte);
   }
   static size_t normalize_alignment(uint64_t alignment)
   {
@@ -117,7 +152,7 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
     if ((alignment & (alignment - 1)) ||
         alignment > static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max()))
       throw std::bad_alloc();
-    return static_cast<size_t>(alignment);
+    return std::max(start_alignment, static_cast<size_t>(alignment));
   }
   [[noreturn]] void refuse()
   {
@@ -128,66 +163,94 @@ class paimon_admitted_pool final : public paimon::MemoryPool {
   {
     if (!bytes) return nullptr;
     if (bytes > static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max())) refuse();
-    for (auto* available = first_; available; available = available->next) {
-      if (available->data) continue;
-      auto* start        = reinterpret_cast<std::byte*>(available);
-      auto* after_header = start + sizeof(block);
-      auto remainder     = available->extent - sizeof(block);
-      // Compute padding without pointer+alignment arithmetic that could overflow.
-      auto padding = (alignment - (reinterpret_cast<uintptr_t>(after_header) & (alignment - 1))) &
-                     (alignment - 1);
-      if (padding > remainder || bytes > remainder - padding) continue;
-      auto* data      = after_header + padding;
-      auto occupied   = sizeof(block) + padding + static_cast<size_t>(bytes);
-      void* tail      = start + occupied;
-      auto tail_bytes = available->extent - occupied;
-      // A split needs an aligned header and at least one usable byte. Otherwise keep the
-      // short remainder in this allocation; it still fits entirely in the fixed backing.
-      if (std::align(alignof(block), sizeof(block) + 1, tail, tail_bytes)) {
-        auto* suffix = ::new (tail) block{available, available->next, tail_bytes, 0, nullptr};
-        if (suffix->next) suffix->next->previous = suffix;
-        available->next = suffix;
-        available->extent -= tail_bytes;
+    constexpr auto prefix = sizeof(block) + sizeof(block*);
+    auto const minimum    = prefix + static_cast<size_t>(bytes);
+    // Free extents are segregated by floor(log2(extent)). Skip empty lists and
+    // those too small even without padding. Only free extents are inspected.
+    auto groups = nonempty_lists_ & (~size_t{0} << size_class(minimum));
+    while (groups) {
+      auto const group = static_cast<size_t>(std::countr_zero(groups));
+      groups &= groups - 1;
+      for (auto* available = free_lists_[group]; available; available = available->next_free) {
+        if (available->extent < minimum) continue;
+        auto* start        = reinterpret_cast<std::byte*>(available);
+        auto* after_header = start + prefix;
+        auto const padding =
+          (alignment - (reinterpret_cast<uintptr_t>(after_header) & (alignment - 1))) &
+          (alignment - 1);
+        if (padding > available->extent - minimum) continue;
+
+        auto* data = after_header + padding;
+        remove_free(available, group);
+        auto const occupied = minimum + padding;
+        void* tail          = start + occupied;
+        auto tail_bytes     = available->extent - occupied;
+        if (std::align(alignof(block), prefix + 1, tail, tail_bytes)) {
+          auto* suffix = ::new (tail) block{available, available->next, tail_bytes, 0};
+          if (suffix->next) suffix->next->previous = suffix;
+          available->next = suffix;
+          available->extent -= tail_bytes;
+          insert_free(suffix);
+        }
+        available->requested = static_cast<size_t>(bytes);
+        // The record is outside the payload. The bitmap certifies exact live
+        // starts before lookup reads a record, even for an aligned interior pointer.
+        std::memcpy(data - sizeof(block*), &available, sizeof(available));
+        auto const slot = (reinterpret_cast<uintptr_t>(data) - arena_start_) / start_alignment;
+        start_byte(slot) |= start_mask(slot);
+        occupied_ += available->extent;
+        peak_occupied_ = std::max(peak_occupied_, occupied_);
+        peak_live_     = std::max(peak_live_, ++live_);
+        return data;
       }
-      available->requested = static_cast<size_t>(bytes);
-      available->data      = data;
-      occupied_ += available->extent;
-      peak_occupied_ = std::max(peak_occupied_, occupied_);
-      peak_live_     = std::max(peak_live_, ++live_);
-      return data;
     }
     refuse();
   }
-  block* find(void* pointer, uint64_t bytes) noexcept
+
+  block* find(void* pointer, uint64_t bytes) const noexcept
   {
-    // Never inspect storage before a caller pointer. The descriptors are our own bounded list.
-    for (auto* entry = first_; entry; entry = entry->next)
-      if (entry->data && entry->data == pointer && entry->requested == bytes) return entry;
-    return nullptr;
+    auto const address = reinterpret_cast<uintptr_t>(pointer);
+    if (address < arena_start_) return nullptr;
+    auto const offset = address - arena_start_;
+    if (offset >= arena_size_ || offset % start_alignment) return nullptr;
+    auto const slot = offset / start_alignment;
+    if ((start_byte(slot) & start_mask(slot)) == std::byte{0}) return nullptr;
+    block* entry;
+    std::memcpy(&entry, static_cast<std::byte*>(pointer) - sizeof(entry), sizeof(entry));
+    return entry->requested == bytes ? entry : nullptr;
   }
-  void release(block* entry) noexcept
+
+  void release(block* entry, void* pointer) noexcept
   {
+    auto const slot = (reinterpret_cast<uintptr_t>(pointer) - arena_start_) / start_alignment;
+    start_byte(slot) &= ~start_mask(slot);
     occupied_ -= entry->extent;
     --live_;
-    entry->data      = nullptr;
     entry->requested = 0;
-    if (entry->next && !entry->next->data) {
-      auto* next = entry->next;
+    if (auto* next = entry->next; next && !next->requested) {
+      remove_free(next, size_class(next->extent));
       entry->extent += next->extent;
       entry->next = next->next;
       if (entry->next) entry->next->previous = entry;
       next->~block();
     }
-    if (entry->previous && !entry->previous->data) {
-      auto* previous = entry->previous;
+    if (auto* previous = entry->previous; previous && !previous->requested) {
+      remove_free(previous, size_class(previous->extent));
       previous->extent += entry->extent;
       previous->next = entry->next;
       if (previous->next) previous->next->previous = previous;
       entry->~block();
+      entry = previous;
     }
+    insert_free(entry);
   }
+
   mutable std::mutex mutex_;
-  block* first_;
+  std::byte* live_starts_;
+  uintptr_t arena_start_;
+  size_t arena_size_;
+  std::array<block*, std::numeric_limits<size_t>::digits> free_lists_{};
+  size_t nonempty_lists_ = 0;
   // Occupied extents include headers, padding and unsplittable tails.
   // The ledger charges the entire retained backing, including free extents.
   uint64_t occupied_ = 0, peak_occupied_ = 0;
@@ -208,8 +271,18 @@ inline std::shared_ptr<paimon_admitted_pool> paimon_admitted_pool::create(
   if (!object) throw std::bad_alloc();
   storage = static_cast<std::byte*>(storage) + sizeof(paimon_admitted_pool);
   bytes -= sizeof(paimon_admitted_pool);
-  if (!std::align(alignof(block), sizeof(block) + 1, storage, bytes)) throw std::bad_alloc();
-  auto* pool = ::new (object) paimon_admitted_pool(storage, bytes);
+  // Reserve one bit per possible aligned start, entirely within the charged
+  // backing. Calculate from the remaining bytes before removing the bitmap
+  // so it also covers every slot in the smaller, resulting arena.
+  auto* starts            = static_cast<std::byte*>(storage);
+  auto const coverage     = start_alignment * bits_per_byte;
+  auto const bitmap_bytes = (bytes + coverage - 1) / coverage;
+  storage                 = starts + bitmap_bytes;
+  bytes -= bitmap_bytes;
+  if (!std::align(alignof(block), sizeof(block) + sizeof(block*) + 1, storage, bytes))
+    throw std::bad_alloc();
+  std::memset(starts, 0, bitmap_bytes);
+  auto* pool = ::new (object) paimon_admitted_pool(starts, storage, bytes);
   // Construction must finish while the caller still owns backing. Otherwise a
   // partially constructed object's unwinding could free its own base storage.
   pool->backing_ = std::move(backing);
