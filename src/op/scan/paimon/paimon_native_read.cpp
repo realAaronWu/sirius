@@ -53,50 +53,116 @@ class inline_executor final : public paimon::Executor {
   uint32_t GetThreadNum() const override { return 1; }
 };
 
+// The stock Avro reader converts read failures to Invalid and preserves their diagnostic.
+constexpr auto stream_stop_message = "Sirius stopped Paimon planning stream I/O";
+
+paimon::Status planning_stopped() { return paimon::Status::Cancelled("Paimon planning stopped"); }
+
+class planning_input_stream final : public paimon::InputStream {
+ public:
+  planning_input_stream(std::unique_ptr<paimon::InputStream> input,
+                        scan_manager::preparation_stop_token stop,
+                        bool& read_cancelled,
+                        std::optional<int64_t> checked_length)
+    : input_(std::move(input)),
+      stop_(std::move(stop)),
+      read_cancelled_(read_cancelled),
+      checked_length_(checked_length)
+  {
+  }
+
+  paimon::Status Close() override { return input_->Close(); }
+  paimon::Result<int64_t> Length() const override
+  {
+    if (checked_length_) return *checked_length_;
+    return input_->Length();
+  }
+  paimon::Result<int64_t> GetPos() const override { return input_->GetPos(); }
+  paimon::Result<std::string> GetUri() const override { return input_->GetUri(); }
+  paimon::Status Seek(int64_t offset, paimon::SeekOrigin origin) override
+  {
+    if (stop_.stop_requested()) return cancelled();
+    return input_->Seek(offset, origin);
+  }
+  paimon::Result<int64_t> Read(char* buffer, int64_t size) override
+  {
+    if (stop_.stop_requested()) return cancelled();
+    return input_->Read(buffer, size);
+  }
+  paimon::Result<int64_t> Read(char* buffer, int64_t size, int64_t offset) override
+  {
+    if (stop_.stop_requested()) return cancelled();
+    return input_->Read(buffer, size, offset);
+  }
+  void ReadAsync(char* buffer,
+                 int64_t size,
+                 int64_t offset,
+                 std::function<void(paimon::Status)>&& callback) override
+  {
+    if (stop_.stop_requested()) {
+      callback(cancelled());
+      return;
+    }
+    input_->ReadAsync(buffer, size, offset, std::move(callback));
+  }
+
+ private:
+  paimon::Status cancelled() const
+  {
+    read_cancelled_ = true;
+    return paimon::Status::Cancelled(stream_stop_message);
+  }
+
+  std::unique_ptr<paimon::InputStream> input_;
+  scan_manager::preparation_stop_token stop_;
+  bool& read_cancelled_;
+  std::optional<int64_t> checked_length_;
+};
+
 class planning_filesystem final : public paimon::FileSystem {
  public:
   planning_filesystem(std::shared_ptr<paimon::FileSystem> filesystem,
                       scan_manager::preparation_stop_token stop,
-                      uint64_t max_open_attempts)
+                      std::string snapshot_path,
+                      std::optional<uint64_t> max_snapshot_bytes)
     : filesystem_(std::move(filesystem)),
       stop_(std::move(stop)),
-      remaining_opens_(max_open_attempts)
+      snapshot_path_(std::move(snapshot_path)),
+      max_snapshot_bytes_(max_snapshot_bytes)
   {
   }
 
   paimon::Result<std::unique_ptr<paimon::InputStream>> Open(std::string const& path) const override
   {
-    auto status = admit_open();
-    if (!status.ok()) return status;
-    return filesystem_->Open(path);
+    if (stop_.stop_requested()) return planning_stopped();
+    return wrap(path, filesystem_->Open(path));
   }
   paimon::Result<std::unique_ptr<paimon::InputStream>> Open(
     paimon::FileStatus const& file) const override
   {
-    auto status = admit_open();
-    if (!status.ok()) return status;
-    return filesystem_->Open(file);
+    if (stop_.stop_requested()) return planning_stopped();
+    return wrap(file.GetPath(), filesystem_->Open(file));
   }
   paimon::Result<paimon::FileStatus> GetFileStatus(std::string const& path) const override
   {
-    if (stop_.stop_requested()) return stopped();
+    if (stop_.stop_requested()) return planning_stopped();
     return filesystem_->GetFileStatus(path);
   }
   paimon::Status ListDir(std::string const& path,
                          std::vector<paimon::BasicFileStatus>* files) const override
   {
-    if (stop_.stop_requested()) return stopped();
+    if (stop_.stop_requested()) return planning_stopped();
     return filesystem_->ListDir(path, files);
   }
   paimon::Status ListFileStatus(std::string const& path,
                                 std::vector<paimon::FileStatus>* files) const override
   {
-    if (stop_.stop_requested()) return stopped();
+    if (stop_.stop_requested()) return planning_stopped();
     return filesystem_->ListFileStatus(path, files);
   }
   paimon::Result<bool> Exists(std::string const& path) const override
   {
-    if (stop_.stop_requested()) return stopped();
+    if (stop_.stop_requested()) return planning_stopped();
     return filesystem_->Exists(path);
   }
   paimon::Result<std::unique_ptr<paimon::OutputStream>> Create(std::string const&,
@@ -111,25 +177,59 @@ class planning_filesystem final : public paimon::FileSystem {
   }
   paimon::Status Delete(std::string const&, bool) const override { return read_only(); }
 
-  void check_completion() const
+  void check_plan(paimon::Status const& status) const
   {
-    if (exceeded_open_limit_)
-      detail::throw_paimon_status(paimon::Status::CapacityError(open_limit));
+    // Restore only our observed stream cancellation wrapped by stock Avro. An
+    // independent SDK error (including an in-flight I/O error) keeps its status.
+    if (!status.ok()) {
+      if (read_cancelled_ && status.IsInvalid() &&
+          status.ToString().find(stream_stop_message) != std::string::npos)
+        detail::throw_paimon_status(planning_stopped());
+      detail::throw_paimon_status(status);
+    }
+    if (max_snapshot_bytes_ && !checked_snapshot_)
+      throw std::runtime_error("Paimon planning did not open the bound snapshot for validation");
   }
 
  private:
-  static constexpr auto open_limit = "Paimon planning exceeded its file-open attempt limit";
-  paimon::Status admit_open() const
+  paimon::Result<std::unique_ptr<paimon::InputStream>> wrap(
+    std::string const& path, paimon::Result<std::unique_ptr<paimon::InputStream>> opened) const
   {
-    if (stop_.stop_requested()) return stopped();
-    if (remaining_opens_ == 0) {
-      exceeded_open_limit_ = true;
-      return paimon::Status::CapacityError(open_limit);
+    if (!opened.ok()) return opened.status();
+    auto stream = std::move(opened).value();
+    if (!stream) return paimon::Status::IOError("Paimon returned an empty input stream");
+    std::optional<int64_t> checked_length;
+    if (max_snapshot_bytes_ && path == snapshot_path_) {
+      auto status = validate_snapshot(*stream, checked_length);
+      if (!status.ok()) {
+        (void)stream->Close();
+        return status;
+      }
+      checked_snapshot_ = true;
     }
-    --remaining_opens_;
-    return paimon::Status::OK();
+    return std::unique_ptr<paimon::InputStream>(std::make_unique<planning_input_stream>(
+      std::move(stream), stop_, read_cancelled_, checked_length));
   }
-  paimon::Status stopped() const { return paimon::Status::Cancelled("Paimon planning stopped"); }
+
+  paimon::Status validate_snapshot(paimon::InputStream& stream,
+                                   std::optional<int64_t>& checked_length) const
+  {
+    if (stop_.stop_requested()) return planning_stopped();
+    // Stock LocalFS Length() stats the path again. Seek/Tell measure the opened
+    // handle. Return that exact size to ReadFile so it cannot resize from a
+    // second measurement.
+    auto status = stream.Seek(0, paimon::FS_SEEK_END);
+    if (!status.ok()) return status;
+    auto length = stream.GetPos();
+    if (!length.ok()) return length.status();
+    if (length.value() < 0) return paimon::Status::IOError("Invalid Paimon snapshot length");
+    if (static_cast<uint64_t>(length.value()) > *max_snapshot_bytes_)
+      return paimon::Status::CapacityError("Paimon snapshot exceeds its file size limit");
+    if (stop_.stop_requested()) return planning_stopped();
+    checked_length = length.value();
+    return stream.Seek(0, paimon::FS_SEEK_SET);
+  }
+
   static paimon::Status read_only()
   {
     return paimon::Status::NotImplemented("planning filesystem is read-only");
@@ -137,11 +237,11 @@ class planning_filesystem final : public paimon::FileSystem {
 
   std::shared_ptr<paimon::FileSystem> filesystem_;
   scan_manager::preparation_stop_token stop_;
+  std::string snapshot_path_;
+  std::optional<uint64_t> max_snapshot_bytes_;
   // Stock planning invokes filesystem operations and inline tasks on the native lane.
-  mutable uint64_t remaining_opens_;
-  // An optional hint can swallow an Open error. An independent terminal SDK error
-  // still wins, but a swallowed refusal must not turn a successful plan into output.
-  mutable bool exceeded_open_limit_ = false;
+  mutable bool read_cancelled_   = false;
+  mutable bool checked_snapshot_ = false;
 };
 
 struct read_owners {
@@ -152,23 +252,25 @@ struct read_owners {
   std::shared_ptr<paimon::Plan> plan;
   std::unique_ptr<paimon::TableRead> read;
 };
-std::unique_ptr<paimon_batch_cursor> open_paimon_read_impl(
-  paimon_read_metadata const& metadata,
-  std::vector<int32_t> const& ids,
-  std::shared_ptr<paimon::MemoryPool> pool,
-  std::shared_ptr<void> modules,
-  int64_t max_rows,
-  scan_manager::preparation_stop_token stop,
-  std::shared_ptr<paimon::FileSystem> filesystem,
-  std::optional<uint64_t> max_planning_open_attempts)
+}  // namespace
+
+std::unique_ptr<paimon_batch_cursor> open_paimon_read(paimon_read_metadata const& metadata,
+                                                      std::vector<int32_t> const& ids,
+                                                      std::shared_ptr<paimon::MemoryPool> pool,
+                                                      std::shared_ptr<void> modules,
+                                                      int64_t max_rows,
+                                                      scan_manager::preparation_stop_token stop,
+                                                      paimon_native_controls const& controls)
 {
   check_stop(stop);
   if (!pool || !modules || max_rows <= 0 || ids.empty() || metadata.branch != "main" ||
       metadata.path.empty() || metadata.schema_json.empty() || metadata.schema_id < 0 ||
       (metadata.snapshot_id && *metadata.snapshot_id <= 0))
     throw std::invalid_argument("Paimon read requires retained main metadata, owners and limits");
-  if (max_planning_open_attempts && (!filesystem || !metadata.snapshot_id))
-    throw std::invalid_argument("Paimon planning I/O requires a numbered snapshot and filesystem");
+  auto const& filesystem = controls.filesystem;
+  if (controls.max_snapshot_bytes && (!filesystem || !metadata.snapshot_id))
+    throw std::invalid_argument(
+      "Paimon snapshot length limit requires a numbered snapshot and filesystem");
   std::set<int32_t> unique;
   for (auto id : ids)
     if (id < 0 || !unique.insert(id).second)
@@ -197,20 +299,21 @@ std::unique_ptr<paimon_batch_cursor> open_paimon_read_impl(
   if (metadata.snapshot_id) {
     paimon::ScanContextBuilder scan(metadata.path);
     std::shared_ptr<planning_filesystem> planning_fs;
-    if (max_planning_open_attempts) {
-      planning_fs =
-        std::make_shared<planning_filesystem>(filesystem, stop, *max_planning_open_attempts);
+    if (filesystem) {
+      auto const snapshot_path = metadata.path + (metadata.path.ends_with('/') ? "" : "/") +
+                                 "snapshot/snapshot-" + std::to_string(*metadata.snapshot_id);
+      planning_fs = std::make_shared<planning_filesystem>(
+        filesystem, stop, snapshot_path, controls.max_snapshot_bytes);
       scan.WithFileSystem(planning_fs);
-    } else if (filesystem) {
-      scan.WithFileSystem(filesystem);
     }
     owners->scan = checked(paimon::TableScan::Create(checked(scan.SetOptions(options)
                                                                .SetTableSchema(metadata.schema_json)
                                                                .WithMemoryPool(owners->pool)
                                                                .WithExecutor(owners->executor)
                                                                .Finish())));
-    owners->plan = checked(owners->scan->CreatePlan());
-    if (planning_fs) planning_fs->check_completion();
+    auto plan    = owners->scan->CreatePlan();
+    if (planning_fs) planning_fs->check_plan(plan.status());
+    owners->plan = checked(std::move(plan));
     if (owners->plan->SnapshotId() != metadata.snapshot_id)
       throw std::runtime_error("Paimon plan changed the retained snapshot");
   }
@@ -247,45 +350,5 @@ std::unique_ptr<paimon_batch_cursor> open_paimon_read_impl(
     }
     throw;
   }
-}
-}  // namespace
-
-std::unique_ptr<paimon_batch_cursor> open_paimon_read(
-  paimon_read_metadata const& metadata,
-  std::vector<int32_t> const& ids,
-  std::shared_ptr<paimon::MemoryPool> pool,
-  std::shared_ptr<void> modules,
-  int64_t max_rows,
-  scan_manager::preparation_stop_token stop,
-  std::shared_ptr<paimon::FileSystem> filesystem)
-{
-  return open_paimon_read_impl(metadata,
-                               ids,
-                               std::move(pool),
-                               std::move(modules),
-                               max_rows,
-                               std::move(stop),
-                               std::move(filesystem),
-                               std::nullopt);
-}
-
-std::unique_ptr<paimon_batch_cursor> open_paimon_read_with_planning_io(
-  paimon_read_metadata const& metadata,
-  std::vector<int32_t> const& ids,
-  std::shared_ptr<paimon::MemoryPool> pool,
-  std::shared_ptr<void> modules,
-  int64_t max_rows,
-  scan_manager::preparation_stop_token stop,
-  std::shared_ptr<paimon::FileSystem> filesystem,
-  uint64_t max_planning_open_attempts)
-{
-  return open_paimon_read_impl(metadata,
-                               ids,
-                               std::move(pool),
-                               std::move(modules),
-                               max_rows,
-                               std::move(stop),
-                               std::move(filesystem),
-                               max_planning_open_attempts);
 }
 }  // namespace sirius::op::scan
